@@ -1,0 +1,122 @@
+/* Integration checks against a running isolated WordPress, not a frontend mock. */
+'use strict';
+const {chromium} = require('playwright');
+const {execFileSync} = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+const assert = require('node:assert/strict');
+const php = process.env.RFA_PHP || '/workspace/.rfa-runtime/php-cli';
+const wpRoot = process.env.RFA_WP_ROOT || '/workspace/.rfa-runtime/wordpress';
+const base = process.env.RFA_WP_URL || 'http://127.0.0.1:8090';
+const bootstrap = `require ${JSON.stringify(wpRoot + '/wp-load.php')};`;
+function wp(code, input = '') { return execFileSync(php, ['-r', bootstrap + code], {input, encoding:'utf8'}).trim(); }
+function cookies(userId) {
+  const raw = JSON.parse(wp(`echo json_encode(array(AUTH_COOKIE => wp_generate_auth_cookie(${userId}, time()+3600, 'auth'), LOGGED_IN_COOKIE => wp_generate_auth_cookie(${userId}, time()+3600, 'logged_in')));`));
+  return Object.entries(raw).map(([name,value]) => ({name,value,url:base,httpOnly:true,sameSite:'Lax'}));
+}
+let checks = 0;
+function passed(name) { checks++; console.log('PASS: '+name); }
+(async () => {
+  const original = wp("echo json_encode(get_option('rfa_config', null));");
+  let browser, postId;
+  try {
+    wp("update_option('rfa_config', RFA_Config::defaults(), false);");
+    postId = wp("echo wp_insert_post(array('post_title'=>'Referral Ads test page','post_status'=>'publish','post_type'=>'page','post_content'=>'[referral_ads_slot id=\"promo\"]')); ");
+    const adminId = wp("$u=get_user_by('login','rfa_developer'); echo $u->ID;");
+    browser = await chromium.launch({executablePath:'/usr/bin/chromium',headless:true,args:['--no-sandbox']});
+    const context = await browser.newContext({viewport:{width:1512,height:1100}});
+    await context.addCookies(cookies(adminId));
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', e=>errors.push(e.message));
+    await page.goto(base+'/wp-admin/admin.php?page=referral-ads');
+    await page.locator('#rfa-admin .rfa-topbar').waitFor();
+    assert.equal(await page.locator('[data-action="format"]').count(),0);
+    passed('Admin page mounts within WordPress');
+    await page.locator('#rfa-global-referrers').fill('google.com\nfacebook.com\ndetik.com');
+    await page.locator('#rfa-global-enabled').check({force:true});
+    await page.locator('[data-action="add"]').first().click();
+    await page.locator('#rfa-campaign-name').fill('Promo pembaca Google');
+    await page.locator('#rfa-campaign-headline').fill('Pilihan untuk pembaca hari ini');
+    assert.equal(await page.locator('[data-action="format"]').count(),5);
+    passed('Campaign editor exposes all five formats');
+    for (const format of ['sticky','native','interstitial','popunder','banner']) {
+      await page.locator(`[data-action="format"][data-value="${format}"]`).click();
+      assert.equal(await page.locator(`[data-action="format"][data-value="${format}"]`).getAttribute('aria-pressed'),'true');
+    }
+    passed('Format cards and live preview switch without errors');
+    await page.locator('[data-action="section"][data-value="links"]').click();
+    await page.locator('#rfa-campaign-directUrl').fill('https://promo.example/offer');
+    await page.locator('#rfa-campaign-linkMode').selectOption('parameter');
+    await page.locator('#rfa-campaign-allowedLinkHosts').fill('promo.example');
+    await page.locator('#rfa-campaign-forwardPage').check({force:true});
+    await page.locator('[data-action="section"][data-value="placement"]').click();
+    await page.locator('#rfa-campaign-placement-type').selectOption('id');
+    await page.locator('#rfa-campaign-placement-value').fill('promo');
+    await page.locator('[data-action="save"]').click();
+    await page.locator('#rfa-notice').filter({hasText:'Pengaturan tersimpan'}).waitFor();
+    const saved = JSON.parse(wp("echo json_encode(get_option('rfa_config'));"));
+    assert.equal(saved.enabled,true);
+    assert.equal(saved.campaigns[0].placement.type,'id');
+    assert.equal(saved.campaigns[0].linkMode,'parameter');
+    assert.deepEqual(saved.referrers,['google.com','facebook.com','detik.com']);
+    passed('UI saves canonical configuration through secured AJAX to database');
+    await page.reload();
+    await page.locator('#rfa-campaign-name').waitFor();
+    assert.equal(await page.locator('#rfa-campaign-name').inputValue(),'Promo pembaca Google');
+    passed('Saved campaign survives page reload');
+    await page.locator('[data-action="duplicate"]').click();
+    assert.equal(await page.locator('.rfa-campaign-item').count(),2);
+    page.once('dialog',dialog=>dialog.accept());
+    await page.locator('[data-action="delete"]').click();
+    assert.equal(await page.locator('.rfa-campaign-item').count(),1);
+    await page.locator('[data-action="save"]').click();
+    await page.locator('#rfa-notice').filter({hasText:'Pengaturan tersimpan'}).waitFor();
+    passed('Duplicate and delete manage campaigns correctly');
+    const token = await page.evaluate(()=>window.RFA_ADMIN.nonce);
+    const noNonce = await context.request.post(base+'/wp-admin/admin-ajax.php',{form:{action:'rfa_save',nonce:'invalid',config:'{}'}});
+    assert.equal(noNonce.status(),403);
+    passed('Invalid nonce cannot save settings');
+    const noConfig = await context.request.post(base+'/wp-admin/admin-ajax.php',{form:{action:'rfa_save',nonce:token,config:'not JSON'}});
+    assert.equal(noConfig.status(),400);
+    passed('Malformed payload receives an error');
+    const anonymous = await browser.newContext();
+    const denied = await anonymous.request.post(base+'/wp-admin/admin-ajax.php',{form:{action:'rfa_save',nonce:token,config:'{}'}});
+    assert.ok(denied.status()>=400);
+    passed('Anonymous user cannot save settings');
+    const testDir = path.resolve(__dirname,'../test-results');
+    fs.mkdirSync(testDir,{recursive:true});
+    await page.locator('[data-action="section"][data-value="creative"]').click();
+    await page.screenshot({path:path.join(testDir,'admin-wide.png'),fullPage:true});
+    await page.setViewportSize({width:390,height:844});
+    await page.screenshot({path:path.join(testDir,'admin-mobile.png'),fullPage:true});
+    assert.ok(await page.evaluate(()=>document.querySelector('#rfa-admin').scrollWidth<=document.documentElement.clientWidth+1));
+    passed('Admin interface fits a mobile viewport');
+    const site = await anonymous.newPage();
+    const url=base+'/?page_id='+postId;
+    await site.goto(url,{referer:'https://www.google.com/search?q=test'});
+    await site.locator('[data-rfa-campaign]').waitFor();
+    assert.equal(await site.locator('#promo [data-rfa-campaign]').count(),1);
+    const dest = new URL(await site.locator('[data-rfa-campaign] a').first().getAttribute('href'));
+    assert.equal(dest.hostname,'promo.example');
+    assert.equal(dest.searchParams.get('source_page'),url);
+    passed('Actual theme shortcode receives an ad with approved referrer and source URL');
+    await site.goto(url,{referer:'https://google.com.evil.example/'});
+    await site.waitForTimeout(800);
+    assert.equal(await site.locator('[data-rfa-campaign]').count(),0);
+    passed('Actual WordPress page rejects lookalike referrer');
+    const fresh = await anonymous.newPage();
+    await fresh.goto(url);
+    await fresh.waitForTimeout(800);
+    assert.equal(await fresh.locator('[data-rfa-campaign]').count(),0);
+    passed('Actual WordPress direct visit never creates an ad');
+    assert.deepEqual(errors,[]);
+    passed('Admin interaction produced no uncaught JavaScript errors');
+    await context.close(); await anonymous.close();
+    console.log(`${checks} WordPress integration checks passed.`);
+  } finally {
+    if(browser) await browser.close();
+    wp("$value=json_decode(stream_get_contents(STDIN),true); if($value===null){delete_option('rfa_config');}else{update_option('rfa_config',$value,false);}", original);
+    if(postId) wp(`wp_delete_post(${Number(postId)}, true);`);
+  }
+})().catch(e=>{console.error(e);process.exitCode=1;});
